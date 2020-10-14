@@ -15,6 +15,8 @@ int EXIT = 0;
 #define str(a) #a
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
+#define DEFAULT_ON_TIME_SEC 30
+
 static void print_usage(void)
 {
 	printf("backlightctl, automatic backlight control, Data Respons Solutions AB\n");
@@ -30,6 +32,7 @@ static void print_usage(void)
 	printf("    brightness\n");
 	printf("    actual_brightness\n");
 	printf("    max_brightness\n");
+	printf("  Will toggle between actual_brightness and 0\n");
 	printf("\n");
 
 	printf("Options:\n");
@@ -39,6 +42,8 @@ static void print_usage(void)
 	printf("    For example: /sys/class/gpio/gpio12\n");
 	printf("    Expects gpio edge property already is configured\n");
 	printf("    See kernel documentation Documentation/gpio/sysfs.txt\n");
+	printf("  -t, --time     Time in seconds to wait for interrupt before disabling backlight\n");
+	printf("    Default: %d\n", DEFAULT_ON_TIME_SEC);
 	printf("\n");
 
 	printf("Return values:\n");
@@ -145,6 +150,15 @@ static int wait_int(const char* path, int timeout_ms)
 	fds.revents = 0;
 
 	int r = 0;
+
+	// clear value before poll
+	char value;
+	if (read(fds.fd, &value, 1) < 0) {
+		r = -errno;
+		pr_err("%s [%d] read: %s\n", path, -r, strerror(-r));
+		goto exit;
+    }
+
 	switch(poll(&fds, 1, timeout_ms)) {
 	case -1:
 		r = -errno;
@@ -158,10 +172,12 @@ static int wait_int(const char* path, int timeout_ms)
 		if ((fds.revents & POLLPRI) != POLLPRI) {
 			// unknown revent
 			r = -EINTR;
+			pr_err("%s [%d] poll: %s\n", path, -r, strerror(-r));
 		}
 		break;
 	}
 
+exit:
 	if (close(fds.fd)) {
 		if (!r) {
 			r = -errno;
@@ -203,7 +219,9 @@ static int fill_backlight(struct backlight* backlight)
 	backlight->off_value[2] = 0;
 	pr_dbg("backlight: off_value: %s", backlight->off_value);
 
-	backlight->on_time.tv_sec = 1;
+	if (backlight->on_time.tv_sec < 1) {
+		backlight->on_time.tv_sec = DEFAULT_ON_TIME_SEC;
+	}
 	backlight->on_time.tv_nsec = 0;
 	pr_dbg("backlight: on_time: %llds\n", (long long) backlight->on_time.tv_sec);
 
@@ -288,7 +306,7 @@ static int control_loop(struct backlight* backlight, struct interrupt* interrupt
 	struct timespec start;
 	int r = timestamp(&start);
 	if (r) {
-		return r;
+		goto exit;
 	}
 	const int delay_ms = 100;
 	while (!EXIT) {
@@ -298,12 +316,12 @@ static int control_loop(struct backlight* backlight, struct interrupt* interrupt
 			// interrupt, reset timer
 			r = timestamp(&start);
 			if (r) {
-				return r;
+				goto exit;
 			}
 			if (!backlight->enabled) {
 				r = set_backlight(backlight, 1);
 				if (r) {
-					return r;
+					goto exit;
 				}
 			}
 			usleep(delay_ms * 1000);
@@ -318,21 +336,27 @@ static int control_loop(struct backlight* backlight, struct interrupt* interrupt
 				case 1:
 					r = set_backlight(backlight, 0);
 					if (r) {
-						return r;
+						goto exit;
 					}
 					break;
 				default:
-					return r;
+					goto exit;
 				}
 				break;
 			}
 			break;
 		default:
-			return r;
+			goto exit;
 		}
 	}
 
-	return 0;
+exit:
+	// restore backlight
+	if (!backlight->enabled) {
+		set_backlight(backlight, 1);
+	}
+
+	return r;
 }
 
 int main(int argc, char** argv)
@@ -358,6 +382,14 @@ int main(int argc, char** argv)
 				return 1;
 			}
 			interrupt.path = argv[i];
+		}
+		else
+		if (!strcmp("--time", argv[i]) || !strcmp("-t", argv[i])) {
+			if (++i >= argc) {
+				fprintf(stderr, "invalid -t/--time\n");
+				return 1;
+			}
+			backlight.on_time.tv_sec = atoi(argv[i]);
 		}
 		else
 		if (!strcmp("--help", argv[i]) || !strcmp("-h", argv[i])) {
