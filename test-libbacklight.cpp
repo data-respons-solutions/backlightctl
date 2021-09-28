@@ -4,20 +4,29 @@
 #include <ctime>
 #include <cstdio>
 
+#include "circular_buf.h"
+
 #define CATCH_CONFIG_MAIN
 #include <catch2/catch_test_macros.hpp>
 
 struct libbacklight_conf {
-	uint32_t max_brightness_step;
-	uint32_t initial_brightness_step;
-	int enable_trigger;
-	struct timespec trigger_timeout;
+	uint32_t max_brightness_step;		// Total number of steps available.
+	uint32_t initial_brightness_step;	// Step we're starting from.
+	int enable_sensor;					// Calculate brightness based on min/max_lux.
+	uint32_t min_lux;					// This value corresponds to brightness step 1.
+	uint32_t max_lux;					// This value corresponds to max_brightness_step.
+	int enable_trigger;					// Enable backlight after trigger received.
+										// Will set backlight to initial_brightness_step,
+										// unless enable_sensor is set, then the value is adjusted
+										// based on sensor input.
+	struct timespec trigger_timeout;	// Time without any trigger until backlight is turned off, step 0.
 };
 
 struct libbacklight_ctrl {
 	struct libbacklight_conf conf;
-	uint32_t brightness_step; // Brightness now
-	struct timespec last_trigger;
+	uint32_t brightness_step; 		// Brightness now
+	struct timespec last_trigger;   // Last time trigger received
+	circular_buf_t lux;
 };
 
 int libbacklight_init(struct libbacklight_ctrl* ctrl, const struct timespec* ts, const struct libbacklight_conf* conf)
@@ -95,8 +104,8 @@ enum libbacklight_action libbacklight_operate(struct libbacklight_ctrl* ctrl, co
 }
 
 TEST_CASE("libbacklight_init simple") {
-
 	struct libbacklight_conf conf;
+	memset(&conf, 0, sizeof(conf));
 	conf.max_brightness_step = 10;
 	conf.initial_brightness_step = 5;
 
@@ -106,13 +115,40 @@ TEST_CASE("libbacklight_init simple") {
 	REQUIRE(r == 0);
 }
 
-TEST_CASE("Test trigger") {
+TEST_CASE("libbacklight_init trigger") {
 	struct libbacklight_conf conf;
+	memset(&conf, 0, sizeof(conf));
 	conf.max_brightness_step = 10;
 	conf.initial_brightness_step = 5;
 	conf.enable_trigger = 1;
 	conf.trigger_timeout.tv_sec = 10;
-	conf.trigger_timeout.tv_nsec = 0;
+	struct libbacklight_ctrl ctrl;
+	struct timespec ts = {0,0};
+	int r = libbacklight_init(&ctrl, &ts, &conf);
+	REQUIRE(r == 0);
+}
+
+TEST_CASE("libbacklight_init sensor") {
+	struct libbacklight_conf conf;
+	memset(&conf, 0, sizeof(conf));
+	conf.max_brightness_step = 10;
+	conf.initial_brightness_step = 5;
+	conf.enable_sensor = 1;
+	conf.lux_min = 10;
+	conf.lux_max = 600;
+	struct libbacklight_ctrl ctrl;
+	struct timespec ts = {0,0};
+	int r = libbacklight_init(&ctrl, &ts, &conf);
+	REQUIRE(r == 0);
+}
+
+TEST_CASE("Test trigger") {
+	struct libbacklight_conf conf;
+	memset(&conf, 0, sizeof(conf));
+	conf.max_brightness_step = 10;
+	conf.initial_brightness_step = 5;
+	conf.enable_trigger = 1;
+	conf.trigger_timeout.tv_sec = 10;
 	struct libbacklight_ctrl ctrl;
 	struct timespec ts = {0,0};
 	int r = libbacklight_init(&ctrl, &ts, &conf);
