@@ -2,7 +2,6 @@
 #include <cstdint>
 #include <cerrno>
 #include <ctime>
-#include <cstdio>
 #include "libbacklight.h"
 
 #define CATCH_CONFIG_MAIN

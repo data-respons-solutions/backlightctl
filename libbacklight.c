@@ -5,8 +5,6 @@
 #include "ringbuf.h"
 #include "libbacklight.h"
 
-#include <stdio.h>
-
 struct libbacklight_ctrl {
 	struct libbacklight_conf conf;
 	struct timespec last_trigger;	// Last time trigger received
@@ -62,7 +60,7 @@ struct libbacklight_ctrl* create_libbacklight(const struct timespec* ts, const s
 			goto error_exit;
 		bctl->lux_per_step = lux_per_step(conf->min_lux, conf->max_lux, conf->max_brightness_step);
 		const uint32_t initial_lux = step_to_lux(conf->min_lux, bctl->lux_per_step, conf->initial_brightness_step);
-		for (size_t i = 0; i < ringbuf_size(bctl->sensor_ring); ++i) {
+		for (size_t i = 0; i < ringbuf_capacity(bctl->sensor_ring); ++i) {
 			ringbuf_push(bctl->sensor_ring, initial_lux);
 			bctl->sensor_sum += initial_lux;
 		}
@@ -140,7 +138,7 @@ enum libbacklight_action libbacklight_operate(struct libbacklight_ctrl* bctl, co
 		 * Brightness will never be disabled (set to 0) by sensor.
 		 * If disabled it's due to trigger timeout and it should be kept disabled.
 		 */
-		if (bctl->brightness_step != 0) {
+		if (bctl->brightness_step > 0) {
 			const uint32_t avg = bctl->sensor_sum / ringbuf_size(bctl->sensor_ring);
 			const uint32_t new_step = lux_to_step(bctl->conf.min_lux, bctl->conf.max_lux, bctl->lux_per_step, avg);
 			if (new_step != bctl->brightness_step) {
