@@ -13,12 +13,15 @@ all: backlightctl test
 backlightctl: $(BUILD)/backlightctl
 
 .PHONY: test
-test: $(BUILD)/test-libbacklight
+test: $(BUILD)/test-libbacklight $(BUILD)/test-ringbuf
 
 $(BUILD)/backlightctl: $(addprefix $(BUILD)/, backlightctl.o log.o)
 	$(CC) -o $@ $^ $(LDFLAGS)
 	
-$(BUILD)/test-libbacklight: $(addprefix $(BUILD)/, test-libbacklight.o)
+$(BUILD)/test-libbacklight: $(addprefix $(BUILD)/, test-libbacklight.o ringbuf.o)
+	$(CXX) -o $@ $^ $(LDFLAGS) -lCatch2Main -lCatch2
+	
+$(BUILD)/test-ringbuf: $(addprefix $(BUILD)/, test-ringbuf.o ringbuf.o)
 	$(CXX) -o $@ $^ $(LDFLAGS) -lCatch2Main -lCatch2
 
 $(BUILD)/%.o: %.cpp 
