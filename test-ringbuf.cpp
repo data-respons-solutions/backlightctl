@@ -1,6 +1,4 @@
 #include <cstdint>
-#include <cstdio>
-
 #include "ringbuf.h"
 
 #define CATCH_CONFIG_MAIN
@@ -95,5 +93,22 @@ TEST_CASE("Test pop") {
 	}
 }
 
+TEST_CASE("Moving average") {
+	struct ringbuf *buf = create_ringbuf(10);
+	for (size_t i = 0; i < ringbuf_capacity(buf); ++i) {
+		ringbuf_push(buf, 0xAA);
+	}
+	check_ringbuf(buf, 10, 10);
 
-// Test overwrite
+	for (size_t i = 0; i < ringbuf_capacity(buf); ++i) {
+		REQUIRE(ringbuf_pop(buf) == 0xAA);
+		check_ringbuf(buf, 9, 10);
+		ringbuf_push(buf, 0xFF);
+		check_ringbuf(buf, 10, 10);
+	}
+
+	for (size_t i = 0; i < ringbuf_capacity(buf); ++i) {
+		REQUIRE(ringbuf_pop(buf) == 0xFF);
+		check_ringbuf(buf, ringbuf_capacity(buf) - (i + 1), 10);
+	}
+}

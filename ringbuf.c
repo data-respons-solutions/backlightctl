@@ -67,7 +67,7 @@ void ringbuf_push(struct ringbuf* buf, uint32_t data)
 uint32_t ringbuf_pop(struct ringbuf* buf)
 {
 	uint32_t data = buf->data[buf->tail];
-	buf->tail = (buf->tail + buf->max - 1) % buf->max;
+	buf->tail = (buf->tail + 1) % buf->max;
 	buf->size--;
 	return data;
 }
