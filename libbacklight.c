@@ -155,3 +155,8 @@ uint32_t libbacklight_brightness(const struct libbacklight_ctrl* bctl)
 {
 	return bctl->brightness_step;
 }
+
+const struct libbacklight_conf* libbacklight_get_conf(const struct libbacklight_ctrl* bctl)
+{
+	return &bctl->conf;
+}

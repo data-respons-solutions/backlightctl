@@ -44,6 +44,10 @@ enum libbacklight_action libbacklight_operate(struct libbacklight_ctrl* bctl, co
  */
 uint32_t libbacklight_brightness(const struct libbacklight_ctrl* bctl);
 
+/* Return current configuration
+ */
+const struct libbacklight_conf* libbacklight_get_conf(const struct libbacklight_ctrl* bctl);
+
 #ifdef __cplusplus
 }
 #endif
