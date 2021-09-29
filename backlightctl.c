@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -8,12 +9,9 @@
 #include <signal.h>
 #include <time.h>
 #include "log.h"
+#include "libbacklight.h"
 
 int EXIT = 0;
-
-#define xstr(a) str(a)
-#define str(a) #a
-#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 #define DEFAULT_ON_TIME_SEC 30
 
@@ -79,10 +77,6 @@ struct backlight {
 	char *brightness;
 	char *actual_brightness;
 	char *max_brightness;
-	char on_value[64];
-	char off_value[64];
-	struct timespec on_time; // unless new interrupt backlight will turn off after this time
-	int enabled;
 };
 
 struct interrupt {
@@ -90,50 +84,76 @@ struct interrupt {
 	char* value;
 };
 
-// read null terminated line into buf with buf_len from file. Return 0 for ok or negative errno for error
-static int read_line(char* buf, int buf_len, const char* file)
+static int read_u32(const char* path, uint32_t* value)
 {
-	FILE *fp = fopen(file, "r");
-	if (!fp) {
-		int e = errno;
-		pr_err("%s [%d] open: %s\n", file, e, strerror(e));
-		return -e;
-	}
 	int r = 0;
-	if (fgets(buf, buf_len, fp) == NULL) {
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) {
 		r = -errno;
-		pr_err("%s [%d] read: %s\n", file, -r, strerror(-r));
+		pr_err("%s [%d] open: %s\n", path, -r, strerror(-r));
+		return r;
 	}
-	if (fclose(fp)) {
-		if (!r) {
-			r = -errno;
-			pr_err("%s [%d] close: %s\n", file, -r, strerror(-r));
-		}
+
+	const size_t buf_size = 64;
+	char buf[buf_size];
+	const ssize_t bytes = read(fd, buf, buf_size - 1);
+	const int read_errno = errno;
+	if (close(fd) != 0) {
+		r = -errno;
+		pr_err("%s [%d] close: %s\n", path, -r, strerror(-r));
+		return r;
 	}
-	return r;
+	if (bytes < 0) {
+		r = -read_errno;
+		pr_err("%s [%d] read: %s\n", path, -r, strerror(-r));
+		return r;
+	}
+	buf[bytes + 1] = '\0';
+	if (sscanf(buf, "%" PRIu32 "", value) != 1) {
+		r = -EFAULT;
+		pr_err("%s [%d]: sscanf: %s\n", path, -r, strerror(-r));
+		return r;
+	}
+
+	return 0;
 }
 
-// write null terminated line to file. Return 0 for ok or negative errno for error
-static int write_line(const char* line, const char* file)
+static int write_u32(const char* path, uint32_t value)
 {
-	FILE *fp = fopen(file, "w");
-	if (!fp) {
-		int e = errno;
-		pr_err("%s [%d] open: %s\n", file, e, strerror(e));
-		return -e;
-	}
+	const int buf_size = 64;
+	char buf[buf_size];
 	int r = 0;
-	if (fputs(line, fp) == EOF) {
+	const int count = snprintf(buf, buf_size, "%" PRIu32"\n", value);
+	if (count < 0)
 		r = -errno;
-		pr_err("%s [%d] write: %s\n", file, -r, strerror(-r));
+	if (count >= buf_size)
+		r = -EINVAL;
+	if (r) {
+		pr_err("%s [%d]: snprintf: %s\n", path, -r, strerror(-r));
+		return r;
 	}
-	if (fclose(fp)) {
-		if (!r) {
-			r = -errno;
-			pr_err("%s [%d] close: %s\n", file, -r, strerror(-r));
-		}
+
+	int fd = open(path, O_WRONLY);
+	if (fd < 0) {
+		r = -errno;
+		pr_err("%s [%d] open: %s\n", path, -r, strerror(-r));
+		return r;
 	}
-	return r;
+
+	const ssize_t bytes = write(fd, buf, count);
+	const int write_errno = errno;
+	if (close(fd) != 0) {
+		r = -errno;
+		pr_err("%s [%d] close: %s\n", path, -r, strerror(-r));
+		return r;
+	}
+	if (bytes < 0) {
+		r = -write_errno;
+		pr_err("%s [%d] write: %s\n", path, -r, strerror(-r));
+		return r;
+	}
+
+	return 0;
 }
 
 // return 0 for interrupt, 1 for timeout, negative errno for error
@@ -188,7 +208,7 @@ exit:
 	return r;
 }
 
-static int fill_backlight(struct backlight* backlight)
+static int fill_backlight(struct backlight* backlight, struct libbacklight_conf* conf)
 {
 	pr_dbg("backlight: path: %s\n", backlight->path);
 
@@ -207,27 +227,16 @@ static int fill_backlight(struct backlight* backlight)
 		return -ENOMEM;
 	}
 	pr_dbg("backlight: max_brightness: %s\n", backlight->max_brightness);
-	int r = read_line(backlight->on_value, ARRAY_SIZE(backlight->on_value), backlight->actual_brightness);
-	if (r) {
+
+	int r = read_u32(backlight->max_brightness, &conf->max_brightness_step);
+	if (r)
 		return r;
-	}
-	pr_dbg("backlight: on_value: %s", backlight->on_value);
+	r = read_u32(backlight->actual_brightness, &conf->initial_brightness_step);
+	if (r)
+		return r;
 
-	_Static_assert(ARRAY_SIZE(backlight->off_value) > 2, "backlight->off_value min size is 3");
-	backlight->off_value[0] = '0';
-	backlight->off_value[1] = '\n';
-	backlight->off_value[2] = 0;
-	pr_dbg("backlight: off_value: %s", backlight->off_value);
-
-	if (backlight->on_time.tv_sec < 1) {
-		backlight->on_time.tv_sec = DEFAULT_ON_TIME_SEC;
-	}
-	backlight->on_time.tv_nsec = 0;
-	pr_dbg("backlight: on_time: %llds\n", (long long) backlight->on_time.tv_sec);
-
-	backlight->enabled = 1;
-	pr_dbg("backlight: enabled: %d\n", backlight->enabled);
-
+	pr_dbg("backlight: max: %" PRIu32 ": initial: %" PRIu32 "\n",
+			conf->max_brightness_step, conf->initial_brightness_step);
 	return 0;
 }
 
@@ -253,108 +262,50 @@ static int timestamp(struct timespec* ts)
 	return 0;
 }
 
-static struct timespec timespec_sub(const struct timespec* ts1, const struct timespec* ts2)
+static int control_loop(const struct libbacklight_conf* conf, const struct backlight* backlight, const struct interrupt* interrupt)
 {
-	struct timespec ts;
-	ts.tv_sec = ts1->tv_sec > ts2->tv_sec ? ts1->tv_sec - ts2->tv_sec : ts2->tv_sec - ts1->tv_sec;
-	ts.tv_nsec = ts1->tv_nsec > ts2->tv_nsec ? ts1->tv_nsec - ts2->tv_nsec : ts2->tv_nsec - ts1->tv_nsec;
-	return ts;
-}
-
-// return 1 if ts1 > ts2
-// return -1 i ts2 > ts1
-// return 0 if equal
-static int timespec_cmp(const struct timespec* ts1, const struct timespec* ts2)
-{
-	if (ts1->tv_sec == ts2->tv_sec) {
-		if (ts1->tv_nsec == ts2->tv_nsec) {
-			return 0;
-		}
-		return ts1->tv_nsec > ts2->tv_nsec ? 1 : -1;
-	}
-	return ts1->tv_sec > ts2->tv_sec ? 1 : -1;
-}
-
-static int set_backlight(struct backlight* backlight, int on)
-{
-	pr_dbg("backlight: set brightness: %s", on ? backlight->on_value : backlight->off_value);
-	int r = write_line(on ? backlight->on_value : backlight->off_value, backlight->brightness);
-	if (r) {
-		return r;
-	}
-	backlight->enabled = on ? 1 : 0;
-	return r;
-}
-
-// return 0 for ok, 1 for exceeded, negative errno for error
-static int time_exceeded(const struct timespec* start, const struct timespec* on_time)
-{
-	struct timespec now;
-	int r = timestamp(&now);
-	if (r) {
-		return r;
-	}
-	struct timespec since_start = timespec_sub(&now, start);
-	if (timespec_cmp(on_time, &since_start) <= 0) {
-		return 1;
-	}
-	return 0;
-}
-
-static int control_loop(struct backlight* backlight, struct interrupt* interrupt)
-{
-	struct timespec start;
-	int r = timestamp(&start);
-	if (r) {
+	struct libbacklight_ctrl *bctl = NULL;
+	struct timespec ts = {0,0};
+	int r = timestamp(&ts);
+	if (!r)
+		bctl = create_libbacklight(&ts, conf);
+	if (r || !bctl) {
+		pr_err("Failed creating libbacklight\n");
+		r = -EINVAL;
 		goto exit;
 	}
+
 	const int delay_ms = 100;
 	while (!EXIT) {
+		int trigger = 0;
 		r = wait_int(interrupt->value, delay_ms);
-		switch (r) {
-		case 0:
-			// interrupt, reset timer
-			r = timestamp(&start);
-			if (r) {
-				goto exit;
-			}
-			if (!backlight->enabled) {
-				r = set_backlight(backlight, 1);
-				if (r) {
-					goto exit;
-				}
-			}
-			usleep(delay_ms * 1000);
+		switch(r) {
+		case 0: // interrupt
+			trigger = 1;
 			break;
-		case 1:
-			// timeout
-			if (backlight->enabled) {
-				r = time_exceeded(&start, &backlight->on_time);
-				switch (r) {
-				case 0:
-					break;
-				case 1:
-					r = set_backlight(backlight, 0);
-					if (r) {
-						goto exit;
-					}
-					break;
-				default:
-					goto exit;
-				}
-				break;
-			}
+		case 1: // timeout
 			break;
-		default:
+		default: // error
 			goto exit;
+		}
+
+		r = timestamp(&ts);
+		if (r)
+			goto exit;
+
+		if (libbacklight_operate(bctl, &ts, trigger, 0) == LIBBACKLIGHT_BRIGHTNESS) {
+			r = write_u32(backlight->brightness, libbacklight_brightness(bctl));
+			if (r)
+				goto exit;
 		}
 	}
 
+	r = 0;
+
 exit:
-	// restore backlight
-	if (!backlight->enabled) {
-		set_backlight(backlight, 1);
-	}
+	// restore initial brightness
+	if (bctl)
+		write_u32(backlight->brightness, libbacklight_get_conf(bctl)->initial_brightness_step);
 
 	return r;
 }
@@ -365,6 +316,9 @@ int main(int argc, char** argv)
 	memset(&backlight, 0, sizeof(backlight));
 	struct interrupt interrupt;
 	memset(&interrupt, 0, sizeof(interrupt));
+	struct libbacklight_conf conf;
+	memset(&conf, 0, sizeof(conf));
+	conf.trigger_timeout.tv_sec = DEFAULT_ON_TIME_SEC;
 
 	if (argc < 2) {
 		print_usage();
@@ -382,6 +336,7 @@ int main(int argc, char** argv)
 				return 1;
 			}
 			interrupt.path = argv[i];
+			conf.enable_trigger = 1;
 		}
 		else
 		if (!strcmp("--time", argv[i]) || !strcmp("-t", argv[i])) {
@@ -389,7 +344,7 @@ int main(int argc, char** argv)
 				fprintf(stderr, "invalid -t/--time\n");
 				return 1;
 			}
-			backlight.on_time.tv_sec = atoi(argv[i]);
+			conf.trigger_timeout.tv_sec = atoi(argv[i]);
 		}
 		else
 		if (!strcmp("--help", argv[i]) || !strcmp("-h", argv[i])) {
@@ -422,8 +377,7 @@ int main(int argc, char** argv)
 	}
 
 	int r = 0;
-
-	r = fill_backlight(&backlight);
+	r = fill_backlight(&backlight, &conf);
 	if (r) {
 		pr_err("Failed initializing backlight [%d]: %s\n", -r, strerror(-r));
 		goto exit;
@@ -441,7 +395,7 @@ int main(int argc, char** argv)
 		goto exit;
 	}
 
-	r = control_loop(&backlight, &interrupt);
+	r = control_loop(&conf, &backlight, &interrupt);
 
 exit:
 	if (backlight.brightness) {
