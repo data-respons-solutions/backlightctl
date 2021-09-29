@@ -56,32 +56,27 @@ TEST_CASE("Test trigger") {
 	SECTION("No action") {
 		for (int i = 0; i < 10; ++i) {
 			struct timespec ts {i, 0};
-			enum libbacklight_action ac = libbacklight_operate(bctl, &ts, 0, 0);
-			REQUIRE(ac == LIBBACKLIGHT_NONE);
+			REQUIRE(libbacklight_operate(bctl, &ts, 0, 0) == LIBBACKLIGHT_NONE);
 			REQUIRE(libbacklight_brightness(bctl) == conf.initial_brightness_step);
 		}
 	}
 
 	SECTION("Timeout") {
 		struct timespec ts {10, 0};
-		enum libbacklight_action ac = libbacklight_operate(bctl, &ts, 0, 0);
-		REQUIRE(ac == LIBBACKLIGHT_BRIGHTNESS);
+		REQUIRE(libbacklight_operate(bctl, &ts, 0, 0) == LIBBACKLIGHT_BRIGHTNESS);
 		REQUIRE(libbacklight_brightness(bctl) == 0);
 	}
 
 	SECTION("Timeout - Trigger - Timeout") {
 		struct timespec ts {10, 0};
-		enum libbacklight_action ac = libbacklight_operate(bctl, &ts, 0, 0);
-		REQUIRE(ac == LIBBACKLIGHT_BRIGHTNESS);
+		REQUIRE(libbacklight_operate(bctl, &ts, 0, 0) == LIBBACKLIGHT_BRIGHTNESS);
 		REQUIRE(libbacklight_brightness(bctl) == 0);
 
-		ac = libbacklight_operate(bctl, &ts, 1, 0);
-		REQUIRE(ac == LIBBACKLIGHT_BRIGHTNESS);
+		REQUIRE(libbacklight_operate(bctl, &ts, 1, 0) == LIBBACKLIGHT_BRIGHTNESS);
 		REQUIRE(libbacklight_brightness(bctl) == conf.initial_brightness_step);
 
 		ts.tv_sec = 21;
-		ac = libbacklight_operate(bctl, &ts, 0, 0);
-		REQUIRE(ac == LIBBACKLIGHT_BRIGHTNESS);
+		REQUIRE(libbacklight_operate(bctl, &ts, 0, 0) == LIBBACKLIGHT_BRIGHTNESS);
 		REQUIRE(libbacklight_brightness(bctl) == 0);
 	}
 }
@@ -101,8 +96,7 @@ TEST_CASE("Test sensor") {
 	SECTION("Stable") {
 		bool change = false;
 		for (int i = 0; i < 100; ++i) {
-			enum libbacklight_action ac = libbacklight_operate(bctl, &start, 0, 290);
-			if (ac == LIBBACKLIGHT_BRIGHTNESS)
+			if (libbacklight_operate(bctl, &start, 0, 290) == LIBBACKLIGHT_BRIGHTNESS)
 				change = true;
 		}
 		REQUIRE(!change);
@@ -112,8 +106,7 @@ TEST_CASE("Test sensor") {
 	SECTION("Min value") {
 		bool change = true;
 		for (int i = 0; i < 100; ++i) {
-			enum libbacklight_action ac = libbacklight_operate(bctl, &start, 0, 42);
-			if (ac == LIBBACKLIGHT_BRIGHTNESS)
+			if (libbacklight_operate(bctl, &start, 0, 42) == LIBBACKLIGHT_BRIGHTNESS)
 				change = true;
 		}
 		REQUIRE(change);
@@ -123,11 +116,67 @@ TEST_CASE("Test sensor") {
 	SECTION("Max value") {
 		bool change = true;
 		for (int i = 0; i < 100; ++i) {
-			enum libbacklight_action ac = libbacklight_operate(bctl, &start, 0, 600);
-			if (ac == LIBBACKLIGHT_BRIGHTNESS)
+			if (libbacklight_operate(bctl, &start, 0, 600) == LIBBACKLIGHT_BRIGHTNESS)
 				change = true;
 		}
 		REQUIRE(change);
+		REQUIRE(libbacklight_brightness(bctl) == 10);
+	}
+}
+
+TEST_CASE("Sensor and Trigger")
+{
+	struct libbacklight_conf conf;
+	memset(&conf, 0, sizeof(conf));
+	conf.max_brightness_step = 10;
+	conf.initial_brightness_step = 5;
+	conf.enable_sensor = 1;
+	conf.min_lux = 42;
+	conf.max_lux = 600;
+	conf.enable_trigger = 1;
+	conf.trigger_timeout.tv_sec = 10;
+	const struct timespec start = {0,0};
+	struct libbacklight_ctrl *bctl = create_libbacklight(&start, &conf);
+	REQUIRE(bctl);
+
+	SECTION("Stable") {
+		struct timespec ts {0, 0};
+		for (int i = 0; i < 100; ++i) {
+			REQUIRE(libbacklight_operate(bctl, &ts, 0, 290) == LIBBACKLIGHT_NONE);
+			REQUIRE(libbacklight_brightness(bctl) == conf.initial_brightness_step);
+		}
+	}
+
+	SECTION("Min value") {
+		bool change = true;
+		for (int i = 0; i < 100; ++i) {
+			if (libbacklight_operate(bctl, &start, 0, 42) == LIBBACKLIGHT_BRIGHTNESS)
+				change = true;
+		}
+		REQUIRE(change);
+		REQUIRE(libbacklight_brightness(bctl) == 1);
+	}
+
+	SECTION("Max value") {
+		bool change = true;
+		for (int i = 0; i < 100; ++i) {
+			if (libbacklight_operate(bctl, &start, 0, 600) == LIBBACKLIGHT_BRIGHTNESS)
+				change = true;
+		}
+		REQUIRE(change);
+		REQUIRE(libbacklight_brightness(bctl) == 10);
+	}
+
+	SECTION("Timeout and don't increment due to lux, set max after trigger") {
+		struct timespec ts = {10,0};
+		REQUIRE(libbacklight_operate(bctl, &ts, 0, 290) == LIBBACKLIGHT_BRIGHTNESS);
+		REQUIRE(libbacklight_brightness(bctl) == 0);
+		for (int i = 0; i < 100; ++i) {
+			REQUIRE(libbacklight_operate(bctl, &ts, 0, 600) == LIBBACKLIGHT_NONE);
+			REQUIRE(libbacklight_brightness(bctl) == 0);
+		}
+
+		REQUIRE(libbacklight_operate(bctl, &ts, 1, 600) == LIBBACKLIGHT_BRIGHTNESS);
 		REQUIRE(libbacklight_brightness(bctl) == 10);
 	}
 }
