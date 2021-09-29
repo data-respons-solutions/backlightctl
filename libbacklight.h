@@ -10,7 +10,7 @@ extern "C" {
 
 struct libbacklight_conf {
 	uint32_t max_brightness_step;		// Total number of steps available.
-	uint32_t initial_brightness_step;	// Step we're starting from.
+	uint32_t initial_brightness_step;	// Step we're starting from. Value between 1 and max_brightness_step.
 	int enable_sensor;					// Calculate brightness based on min/max_lux.
 	uint32_t min_lux;					// This value corresponds to brightness step 1.
 	uint32_t max_lux;					// This value corresponds to max_brightness_step.

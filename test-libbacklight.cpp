@@ -93,9 +93,42 @@ TEST_CASE("Test sensor") {
 	conf.max_brightness_step = 10;
 	conf.initial_brightness_step = 5;
 	conf.enable_sensor = 1;
-	conf.min_lux = 20;
+	conf.min_lux = 42;
 	conf.max_lux = 600;
 	const struct timespec start = {0,0};
 	struct libbacklight_ctrl *bctl = create_libbacklight(&start, &conf);
 	REQUIRE(bctl);
+
+	SECTION("Stable") {
+		bool change = false;
+		for (int i = 0; i < 100; ++i) {
+			enum libbacklight_action ac = libbacklight_operate(bctl, &start, 0, 290);
+			if (ac == LIBBACKLIGHT_BRIGHTNESS)
+				change = true;
+		}
+		REQUIRE(!change);
+		REQUIRE(libbacklight_brightness(bctl) == 5);
+	}
+
+	SECTION("Min value") {
+		bool change = true;
+		for (int i = 0; i < 100; ++i) {
+			enum libbacklight_action ac = libbacklight_operate(bctl, &start, 0, 42);
+			if (ac == LIBBACKLIGHT_BRIGHTNESS)
+				change = true;
+		}
+		REQUIRE(change);
+		REQUIRE(libbacklight_brightness(bctl) == 1);
+	}
+
+	SECTION("Max value") {
+		bool change = true;
+		for (int i = 0; i < 100; ++i) {
+			enum libbacklight_action ac = libbacklight_operate(bctl, &start, 0, 600);
+			if (ac == LIBBACKLIGHT_BRIGHTNESS)
+				change = true;
+		}
+		REQUIRE(change);
+		REQUIRE(libbacklight_brightness(bctl) == 10);
+	}
 }
