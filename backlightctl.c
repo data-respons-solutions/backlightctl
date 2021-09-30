@@ -53,7 +53,42 @@ static void print_usage(void)
 	printf("\n");
 }
 
-char* join_path(const char* base, const char* add)
+void sighandler(int sig)
+{
+	(void) sig;
+	EXIT = 1;
+}
+
+struct devices {
+	char *backlight_path;
+	char *backlight_brightness;
+	char *backlight_actual_brightness;
+	char *backlight_max_brightness;
+	char *interrupt_path;
+	char *interrupt_value;
+};
+
+static void free_devices(struct devices* d)
+{
+	if (d->backlight_brightness) {
+		free(d->backlight_brightness);
+		d->backlight_brightness = NULL;
+	}
+	if (d->backlight_actual_brightness) {
+		free(d->backlight_actual_brightness);
+		d->backlight_actual_brightness = NULL;
+	}
+	if (d->backlight_max_brightness) {
+		free(d->backlight_max_brightness);
+		d->backlight_max_brightness = NULL;
+	}
+	if (d->interrupt_value) {
+		free(d->interrupt_value);
+		d->interrupt_value = NULL;
+	}
+}
+
+static char* join_path(const char* base, const char* add)
 {
 	const char *fmt = "%s/%s";
 	int sz = snprintf(NULL, 0, fmt, base, add) + 1;
@@ -69,23 +104,36 @@ char* join_path(const char* base, const char* add)
 	return NULL;
 }
 
-void sighandler(int sig)
+
+/*
+ *  Fills backlight_* and interrupt_* if respective path available.
+ */
+static int init_devices(struct devices* d)
 {
-	(void) sig;
-	EXIT = 1;
+	if (d->backlight_path) {
+		pr_dbg("backlight: path: %s\n", d->backlight_path);
+
+		if (!(d->backlight_brightness = join_path(d->backlight_path, "brightness")))
+			goto error_exit;
+		if (!(d->backlight_actual_brightness = join_path(d->backlight_path, "actual_brightness")))
+			goto error_exit;
+		if (!(d->backlight_max_brightness = join_path(d->backlight_path, "max_brightness")))
+			goto error_exit;
+	}
+
+	if (d->interrupt_path) {
+		pr_dbg("interrupt: path: %s\n", d->interrupt_path);
+
+		if (!(d->interrupt_value = join_path(d->interrupt_path, "value")))
+			goto error_exit;
+	}
+
+	return 0;
+
+error_exit:
+	free_devices(d);
+	return -ENOMEM;
 }
-
-struct backlight {
-	char *path;
-	char *brightness;
-	char *actual_brightness;
-	char *max_brightness;
-};
-
-struct interrupt {
-	char *path;
-	char* value;
-};
 
 static int read_u32(const char* path, uint32_t* value)
 {
@@ -159,6 +207,21 @@ static int write_u32(const char* path, uint32_t value)
 	return 0;
 }
 
+static int init_conf(struct libbacklight_conf* conf, const struct devices* d)
+{
+	int r = read_u32(d->backlight_max_brightness, &conf->max_brightness_step);
+	if (r)
+		return r;
+	r = read_u32(d->backlight_actual_brightness, &conf->initial_brightness_step);
+	if (r)
+		return r;
+
+	pr_dbg("backlight: max: %" PRIu32 ": initial: %" PRIu32 "\n",
+			conf->max_brightness_step, conf->initial_brightness_step);
+
+	return 0;
+}
+
 // return 0 for interrupt, 1 for timeout, negative errno for error
 static int wait_int(const char* path, int timeout_ms)
 {
@@ -211,51 +274,6 @@ exit:
 	return r;
 }
 
-static int fill_backlight(struct backlight* backlight, struct libbacklight_conf* conf)
-{
-	pr_dbg("backlight: path: %s\n", backlight->path);
-
-	backlight->brightness = join_path(backlight->path, "brightness");
-	if (!backlight->brightness) {
-		return -ENOMEM;
-	}
-	pr_dbg("backlight: brightness: %s\n", backlight->brightness);
-	backlight->actual_brightness = join_path(backlight->path, "actual_brightness");
-	if (!backlight->actual_brightness) {
-		return -ENOMEM;
-	}
-	pr_dbg("backlight: actual_brightness: %s\n", backlight->actual_brightness);
-	backlight->max_brightness = join_path(backlight->path, "max_brightness");
-	if (!backlight->max_brightness) {
-		return -ENOMEM;
-	}
-	pr_dbg("backlight: max_brightness: %s\n", backlight->max_brightness);
-
-	int r = read_u32(backlight->max_brightness, &conf->max_brightness_step);
-	if (r)
-		return r;
-	r = read_u32(backlight->actual_brightness, &conf->initial_brightness_step);
-	if (r)
-		return r;
-
-	pr_dbg("backlight: max: %" PRIu32 ": initial: %" PRIu32 "\n",
-			conf->max_brightness_step, conf->initial_brightness_step);
-	return 0;
-}
-
-static int fill_interrupt(struct interrupt* interrupt)
-{
-	pr_dbg("interrupt: path: %s\n", interrupt->path);
-
-	interrupt->value = join_path(interrupt->path, "value");
-	if (!interrupt->value) {
-		return -ENOMEM;
-	}
-	pr_dbg("interrupt: value: %s\n", interrupt->value);
-
-	return 0;
-}
-
 static int timestamp(struct timespec* ts)
 {
 	if (clock_gettime(CLOCK_MONOTONIC, ts)) {
@@ -265,23 +283,15 @@ static int timestamp(struct timespec* ts)
 	return 0;
 }
 
-static int control_loop(const struct libbacklight_conf* conf, const struct backlight* backlight, const struct interrupt* interrupt)
+static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 {
-	struct libbacklight_ctrl *bctl = NULL;
-	struct timespec ts = {0,0};
-	int r = timestamp(&ts);
-	if (!r)
-		bctl = create_libbacklight(&ts, conf);
-	if (r || !bctl) {
-		pr_err("Failed creating libbacklight\n");
-		r = -EINVAL;
-		goto exit;
-	}
-
 	const int delay_ms = 100;
+	struct timespec ts = {0,0};
+	int r = 0;
+
 	while (!EXIT) {
 		int trigger = 0;
-		r = wait_int(interrupt->value, delay_ms);
+		r = wait_int(d->interrupt_value, delay_ms);
 		switch(r) {
 		case 0: // interrupt
 			trigger = 1;
@@ -297,7 +307,7 @@ static int control_loop(const struct libbacklight_conf* conf, const struct backl
 			goto exit;
 
 		if (libbacklight_operate(bctl, &ts, trigger, 0) == LIBBACKLIGHT_BRIGHTNESS) {
-			r = write_u32(backlight->brightness, libbacklight_brightness(bctl));
+			r = write_u32(d->backlight_brightness, libbacklight_brightness(bctl));
 			if (r)
 				goto exit;
 		}
@@ -306,21 +316,16 @@ static int control_loop(const struct libbacklight_conf* conf, const struct backl
 	r = 0;
 
 exit:
-	// restore initial brightness
-	if (bctl) {
-		write_u32(backlight->brightness, libbacklight_get_conf(bctl)->initial_brightness_step);
-		destroy_libbacklight(&bctl);
-	}
+	write_u32(d->backlight_brightness, libbacklight_get_conf(bctl)->initial_brightness_step);
 
 	return r;
 }
 
 int main(int argc, char** argv)
 {
-	struct backlight backlight;
-	memset(&backlight, 0, sizeof(backlight));
-	struct interrupt interrupt;
-	memset(&interrupt, 0, sizeof(interrupt));
+	struct libbacklight_ctrl *bctl = NULL;
+	struct devices devices;
+	memset(&devices, 0, sizeof(devices));
 	struct libbacklight_conf conf;
 	memset(&conf, 0, sizeof(conf));
 	conf.trigger_timeout.tv_sec = DEFAULT_ON_TIME_SEC;
@@ -340,7 +345,7 @@ int main(int argc, char** argv)
 				fprintf(stderr, "invalid -i/--int\n");
 				return 1;
 			}
-			interrupt.path = argv[i];
+			devices.interrupt_path = argv[i];
 			conf.enable_trigger = 1;
 		}
 		else
@@ -362,8 +367,8 @@ int main(int argc, char** argv)
 			return 1;
 		}
 		else {
-			if (!backlight.path) {
-				backlight.path = argv[i];
+			if (!devices.backlight_path) {
+				devices.backlight_path = argv[i];
 			}
 			else {
 				fprintf(stderr, "invalid argument: %s\n", argv[i]);
@@ -372,53 +377,39 @@ int main(int argc, char** argv)
 		}
 	}
 
-	if (!backlight.path) {
-		fprintf(stderr, "mandatory argument PATH missing\n");
+	if (!devices.backlight_path) {
+		pr_err("mandatory argument PATH missing\n");
 		return 1;
 	}
-	if (!interrupt.path) {
-		fprintf(stderr, "mandatory argument -i/--int missing\n");
+	if (!devices.interrupt_path) {
+		pr_err("mandatory argument -i/--int missing\n");
 		return 1;
 	}
 
-	int r = 0;
-	r = fill_backlight(&backlight, &conf);
+	struct timespec start = {0,0};
+	int r = init_devices(&devices);
 	if (r) {
-		pr_err("Failed initializing backlight [%d]: %s\n", -r, strerror(-r));
+		pr_err("Memory allocation failed for file paths\n");
 		goto exit;
 	}
 
-	r = fill_interrupt(&interrupt);
-	if (r) {
-		pr_err("Failed initializing interrupt [%d]: %s\n", -r, strerror(-r));
+	r = init_conf(&conf, &devices);
+	if (r)
+		goto exit;
+
+	r = timestamp(&start);
+	if (r)
+		goto exit;
+
+	if ((bctl = create_libbacklight(&start, &conf)) == NULL) {
+		r = -EFAULT;
+		pr_err("Failed initializing control logic");
 		goto exit;
 	}
 
-	if (signal(SIGINT, sighandler) == SIG_ERR) {
-		r = -errno;
-		pr_err("Failed initializing signal handler [%d]: %s\n", -r, strerror(-r));
-		goto exit;
-	}
-
-	r = control_loop(&conf, &backlight, &interrupt);
-
+	r = control_loop(bctl, &devices);
 exit:
-	if (backlight.brightness) {
-		free(backlight.brightness);
-		backlight.brightness = NULL;
-	}
-	if (backlight.actual_brightness) {
-		free(backlight.actual_brightness);
-		backlight.actual_brightness = NULL;
-	}
-	if (backlight.max_brightness) {
-		free(backlight.max_brightness);
-		backlight.max_brightness = NULL;
-	}
-	if (interrupt.value) {
-		free(interrupt.value);
-		interrupt.value = NULL;
-	}
-
+	free_devices(&devices);
+	destroy_libbacklight(&bctl);
 	return r;
 }
