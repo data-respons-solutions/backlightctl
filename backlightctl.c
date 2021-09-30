@@ -7,11 +7,10 @@
 #include <poll.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/signalfd.h>
 #include <time.h>
 #include "log.h"
 #include "libbacklight.h"
-
-int EXIT = 0;
 
 #define xstr(a) str(a)
 #define str(a) #a
@@ -51,12 +50,6 @@ static void print_usage(void)
 	printf("  0 if ok\n");
 	printf("  errno for error\n");
 	printf("\n");
-}
-
-void sighandler(int sig)
-{
-	(void) sig;
-	EXIT = 1;
 }
 
 struct devices {
@@ -222,56 +215,31 @@ static int init_conf(struct libbacklight_conf* conf, const struct devices* d)
 	return 0;
 }
 
-// return 0 for interrupt, 1 for timeout, negative errno for error
-static int wait_int(const char* path, int timeout_ms)
+
+// return 0 for interrupt, 1 for timeout, 2 for signal, negative errno for error
+// fds[0] = signal
+// fds[1] = interrupt
+static int wait_int(struct pollfd* fds, nfds_t nfds, int timeout_ms)
 {
-	struct pollfd fds;
-	fds.fd = open(path, O_RDONLY);
-	if (fds.fd < 0) {
-		int e = errno;
-		pr_err("%s [%d] open: %s\n", path, e, strerror(e));
-		return -e;
-	}
-	fds.events = POLLPRI;
-	fds.revents = 0;
-
 	int r = 0;
-
-	// clear value before poll
-	char value;
-	if (read(fds.fd, &value, 1) < 0) {
-		r = -errno;
-		pr_err("%s [%d] read: %s\n", path, -r, strerror(-r));
-		goto exit;
-    }
-
-	switch(poll(&fds, 1, timeout_ms)) {
+	switch(poll(fds, nfds, timeout_ms)) {
 	case -1:
 		r = -errno;
-		pr_err("%s [%d] poll: %s\n", path, -r, strerror(-r));
-		break;
+		pr_err("poll [%d]: %s\n", -r, strerror(-r));
+		return r;
 	case 0:
-		// timeout
-		r = 1;
-		break;
+		return 1;
 	default:
-		if ((fds.revents & POLLPRI) != POLLPRI) {
-			// unknown revent
-			r = -EINTR;
-			pr_err("%s [%d] poll: %s\n", path, -r, strerror(-r));
+		if ((fds[0].revents != 0)) {
+			fds[0].revents = 0;
+			return 2;
 		}
-		break;
-	}
-
-exit:
-	if (close(fds.fd)) {
-		if (!r) {
-			r = -errno;
-			pr_err("%s [%d] close: %s\n", path, -r, strerror(-r));
+		if (nfds > 1 && fds[1].revents != 0) {
+			fds[1].revents = 0;
+			return 0;
 		}
+		return -EINTR;
 	}
-
-	return r;
 }
 
 static int timestamp(struct timespec* ts)
@@ -283,21 +251,76 @@ static int timestamp(struct timespec* ts)
 	return 0;
 }
 
+static int get_interrupt(const char* path)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		fd = -errno;
+	}
+	else {
+		// clear value before polling
+		char value;
+		if (read(fd, &value, 1) < 0) {
+			close(fd);
+			fd = -errno;
+	    }
+	}
+	return fd;
+}
+
+static int get_signalfd(void)
+{
+	sigset_t mask;
+
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGINT);
+	sigaddset(&mask, SIGTERM);
+
+	int r = -1;
+
+	if (sigprocmask(SIG_BLOCK, &mask, NULL) != -1)
+		r = signalfd(-1, &mask, 0);
+	return r;
+}
+
 static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 {
 	const int delay_ms = 100;
 	struct timespec ts = {0,0};
 	int r = 0;
+	struct pollfd fds[2];
+	fds[0].fd = get_signalfd();
+	if (fds[0].fd < 0) {
+		pr_err("Failed installing signal handler\n");
+		return -EFAULT;
+	}
+	fds[0].events = POLLIN;
+	fds[0].revents = 0;
 
-	while (!EXIT) {
+	if (d->interrupt_value) {
+		fds[1].fd = get_interrupt(d->interrupt_value);
+		if (fds[1].fd < 0) {
+			r = -errno;
+			pr_err("%s [%d]: %s\n", d->interrupt_value, -r, strerror(-r));
+			return r;
+		}
+		fds[1].events = POLLPRI;
+		fds[1].revents = 0;
+	}
+
+	while (1) {
 		int trigger = 0;
-		r = wait_int(d->interrupt_value, delay_ms);
+		r = wait_int(fds, d->interrupt_value ? 2 : 1, delay_ms);
 		switch(r) {
 		case 0: // interrupt
 			trigger = 1;
 			break;
 		case 1: // timeout
 			break;
+		case 2: // signal
+			r = 0;
+			printf("Received signal -- exit\n");
+			goto exit;
 		default: // error
 			goto exit;
 		}
@@ -307,6 +330,7 @@ static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 			goto exit;
 
 		if (libbacklight_operate(bctl, &ts, trigger, 0) == LIBBACKLIGHT_BRIGHTNESS) {
+			pr_dbg("backlight: brightness -> %" PRIu32 "\n", libbacklight_brightness(bctl));
 			r = write_u32(d->backlight_brightness, libbacklight_brightness(bctl));
 			if (r)
 				goto exit;
@@ -317,7 +341,8 @@ static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 
 exit:
 	write_u32(d->backlight_brightness, libbacklight_get_conf(bctl)->initial_brightness_step);
-
+	if (fds[1].fd >= 0)
+		close(fds[1].fd);
 	return r;
 }
 
