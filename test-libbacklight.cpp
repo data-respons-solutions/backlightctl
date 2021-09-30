@@ -15,6 +15,8 @@ TEST_CASE("create_libbacklight simple") {
 	struct timespec ts = {0,0};
 	struct libbacklight_ctrl *bctl = create_libbacklight(&ts, &conf);
 	REQUIRE(bctl);
+
+	destroy_libbacklight(&bctl);
 }
 
 TEST_CASE("create_libbacklight trigger") {
@@ -27,6 +29,8 @@ TEST_CASE("create_libbacklight trigger") {
 	struct timespec ts = {0,0};
 	struct libbacklight_ctrl *bctl = create_libbacklight(&ts, &conf);
 	REQUIRE(bctl);
+
+	destroy_libbacklight(&bctl);
 }
 
 TEST_CASE("create_libbacklight sensor") {
@@ -40,6 +44,8 @@ TEST_CASE("create_libbacklight sensor") {
 	struct timespec ts = {0,0};
 	struct libbacklight_ctrl *bctl = create_libbacklight(&ts, &conf);
 	REQUIRE(bctl);
+
+	destroy_libbacklight(&bctl);
 }
 
 TEST_CASE("Test trigger") {
@@ -79,6 +85,8 @@ TEST_CASE("Test trigger") {
 		REQUIRE(libbacklight_operate(bctl, &ts, 0, 0) == LIBBACKLIGHT_BRIGHTNESS);
 		REQUIRE(libbacklight_brightness(bctl) == 0);
 	}
+
+	destroy_libbacklight(&bctl);
 }
 
 TEST_CASE("Test sensor") {
@@ -122,6 +130,8 @@ TEST_CASE("Test sensor") {
 		REQUIRE(change);
 		REQUIRE(libbacklight_brightness(bctl) == 10);
 	}
+
+	destroy_libbacklight(&bctl);
 }
 
 TEST_CASE("Sensor and Trigger")
@@ -179,4 +189,6 @@ TEST_CASE("Sensor and Trigger")
 		REQUIRE(libbacklight_operate(bctl, &ts, 1, 600) == LIBBACKLIGHT_BRIGHTNESS);
 		REQUIRE(libbacklight_brightness(bctl) == 10);
 	}
+
+	destroy_libbacklight(&bctl);
 }

@@ -20,6 +20,8 @@ TEST_CASE("Test empty") {
 	struct ringbuf *buf = create_ringbuf(10);
 	check_ringbuf(buf, 0, 10);
 	destroy_ringbuf(&buf);
+
+	destroy_ringbuf(&buf);
 }
 
 TEST_CASE("Test full") {
@@ -27,6 +29,8 @@ TEST_CASE("Test full") {
 	ringbuf_push(buf, 1);
 	ringbuf_push(buf, 1);
 	check_ringbuf(buf, 2, 2);
+
+	destroy_ringbuf(&buf);
 }
 
 TEST_CASE("Test push") {
@@ -49,6 +53,8 @@ TEST_CASE("Test push") {
 		ringbuf_push(buf, 3);
 		check_ringbuf(buf, 2, 2);
 	}
+
+	destroy_ringbuf(&buf);
 }
 
 TEST_CASE("Test pop") {
@@ -91,6 +97,8 @@ TEST_CASE("Test pop") {
 		REQUIRE(v3 == 3);
 		check_ringbuf(buf, 0, 2);
 	}
+
+	destroy_ringbuf(&buf);
 }
 
 TEST_CASE("Moving average") {
@@ -111,4 +119,6 @@ TEST_CASE("Moving average") {
 		REQUIRE(ringbuf_pop(buf) == 0xFF);
 		check_ringbuf(buf, ringbuf_capacity(buf) - (i + 1), 10);
 	}
+
+	destroy_ringbuf(&buf);
 }

@@ -13,6 +13,9 @@
 
 int EXIT = 0;
 
+#define xstr(a) str(a)
+#define str(a) #a
+
 #define DEFAULT_ON_TIME_SEC 30
 
 static void print_usage(void)
@@ -304,8 +307,10 @@ static int control_loop(const struct libbacklight_conf* conf, const struct backl
 
 exit:
 	// restore initial brightness
-	if (bctl)
+	if (bctl) {
 		write_u32(backlight->brightness, libbacklight_get_conf(bctl)->initial_brightness_step);
+		destroy_libbacklight(&bctl);
+	}
 
 	return r;
 }
