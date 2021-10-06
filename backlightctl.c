@@ -43,6 +43,7 @@ static void print_usage(void)
 	printf("  -i, --int      interrupt input\n");
 	printf("    path to gpio interrupt input\n");
 	printf("    For example: /sys/class/gpio/gpio12\n");
+	printf("    Turn off backlight after --time inactivity\n");
 	printf("    Expects gpio edge property already is configured\n");
 	printf("    See kernel documentation Documentation/gpio/sysfs.txt\n");
 	printf("  -t, --time     Time in seconds to wait for interrupt before disabling backlight\n");
@@ -50,10 +51,18 @@ static void print_usage(void)
 	printf("  -s, --sensor   Sensor input\n");
 	printf("    iio device and channel in format dev:chan\n");
 	printf("    For example: vcnl4000:illuminance\n");
+	printf("    Control backlight based on sensor input\n");
 	printf("  --lmin         Lux value where backlight it set to 1\n");
 	printf("    Default: %d\n", DEFAULT_MIN_LUX);
 	printf("  --lmax         Lux value where backlight it set to max\n");
 	printf("    Default: %d\n", DEFAULT_MAX_LUX);
+	printf("  -p, --prox     Proximity input\n");
+	printf("    iio device and channel in format dev:chan\n");
+	printf("    For example: vcnl4000:proximity\n");
+	printf("    Turn off backlight after --time inactivity\n");
+	printf("    If input below iio attribute nearlevel then backlight is kept enabled\n");
+	printf("  -n, --near     Proximity near level override\n");
+	printf("    Default to 0 if no \"nearlevel\" iio attribute for proximity input channel\n");
 	printf("\n");
 
 	printf("Return values:\n");
@@ -71,6 +80,9 @@ struct devices {
 	char *interrupt_value;
 	char *sensor;
 	struct iio_channel *sensor_ch;
+	char *prox;
+	struct iio_channel *prox_ch;
+	long long prox_nearlevel;
 };
 
 static void free_devices(struct devices* d)
@@ -95,6 +107,10 @@ static void free_devices(struct devices* d)
 	if (!ctx && d->sensor_ch) {
 		ctx = (struct iio_context*) iio_device_get_context(iio_channel_get_device(d->sensor_ch));
 		d->sensor_ch = NULL;
+	}
+	if (!ctx && d->prox_ch) {
+		ctx = (struct iio_context*) iio_device_get_context(iio_channel_get_device(d->prox_ch));
+		d->prox_ch = NULL;
 	}
 	if (ctx)
 		iio_context_destroy(ctx);
@@ -179,7 +195,7 @@ static int init_devices(struct devices* d)
 			goto error_exit;
 	}
 
-	if (d->sensor) {
+	if (d->sensor || d->prox) {
 		pr_dbg("sensor [device:channel]: %s\n", d->sensor);
 		ctx = iio_create_local_context();
 		if (!ctx) {
@@ -187,7 +203,11 @@ static int init_devices(struct devices* d)
 			pr_err("Failed creating iio context: %s\n", strerror(-r));
 			goto error_exit;
 		}
-		if ((d->sensor_ch = init_iio_ch(ctx, d->sensor)) == NULL) {
+		if (d->sensor && (d->sensor_ch = init_iio_ch(ctx, d->sensor)) == NULL) {
+			r = -ENODEV;
+			goto error_exit;
+		}
+		if (d->prox && (d->prox_ch = init_iio_ch(ctx, d->prox)) == NULL) {
 			r = -ENODEV;
 			goto error_exit;
 		}
@@ -200,6 +220,7 @@ error_exit:
 	if (ctx)
 		iio_context_destroy(ctx);
 	d->sensor_ch = NULL;
+	d->prox_ch = NULL;
 	free_devices(d);
 	return r;
 }
@@ -276,7 +297,7 @@ static int write_u32(const char* path, uint32_t value)
 	return 0;
 }
 
-static int init_conf(struct libbacklight_conf* conf, const struct devices* d)
+static int init_conf(struct libbacklight_conf* conf, struct devices* d)
 {
 	int r = read_u32(d->backlight_max_brightness, &conf->max_brightness_step);
 	if (r)
@@ -290,6 +311,17 @@ static int init_conf(struct libbacklight_conf* conf, const struct devices* d)
 
 	if (conf->enable_sensor)
 		pr_dbg("sensor: max: %" PRIu32 ": min: %" PRIu32"\n", conf->max_lux, conf->min_lux);
+
+	if (d->prox_ch) {
+		if (iio_channel_find_attr(d->prox_ch, "nearlevel") != NULL) {
+			r = iio_channel_attr_read_longlong(d->prox_ch, "nearlevel", &d->prox_nearlevel);
+			if (r) {
+				pr_err("prox: nearlevel reading failed: %s\n", strerror(-r));
+				return -EIO;
+			}
+		}
+		pr_dbg("prox: nearlevel: %" PRIu32 "\n", d->prox_nearlevel);
+	}
 
 	return 0;
 }
@@ -377,6 +409,20 @@ static int read_sensor(const struct iio_channel* ch, uint32_t* lux)
 	return 0;
 }
 
+static int read_prox(const struct iio_channel* ch, long long nearlevel, long long* prev, int* trigger)
+{
+	long long val = 0LL;
+	int r = iio_channel_attr_read_longlong(ch, "raw", &val);
+	if (r) {
+		pr_err("Failed reading prox: %s\n", strerror(-r));
+		return r;
+	}
+
+	*trigger = (val <= nearlevel || val != *prev) ? 1 : 0;
+	*prev = val;
+	return 0;
+}
+
 static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 {
 	const int delay_ms = 100;
@@ -404,11 +450,12 @@ static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 		interruptfd.events = POLLPRI;
 		interruptfd.revents = 0;
 	}
+	long long prox_previous = 0LL;
 
 	while (1) {
 		int trigger = 0;
 
-		if (interruptfd.fd >= 0) {
+		if (!trigger && interruptfd.fd >= 0) {
 			r = wait_fd(&interruptfd, 0, &trigger);
 			if (r)
 				goto exit;
@@ -416,11 +463,18 @@ static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 				pr_dbg("interrupt: %d\n", trigger);
 		}
 
+		if (!trigger && d->prox_ch) {
+			r = read_prox(d->prox_ch, d->prox_nearlevel, &prox_previous, &trigger);
+			if (r)
+				goto exit;
+			if (trigger != 0)
+				pr_dbg("prox: %d: raw %lld\n", trigger, prox_previous);
+		}
+
 		if (d->sensor_ch) {
 			r = read_sensor(d->sensor_ch, &lux);
 			if (r)
 				goto exit;
-			pr_dbg("sensor: %" PRIu32 " lux\n", lux);
 		}
 
 		r = timestamp(&ts);
@@ -428,7 +482,7 @@ static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 			goto exit;
 
 		if (libbacklight_operate(bctl, &ts, trigger, lux) == LIBBACKLIGHT_BRIGHTNESS) {
-			pr_dbg("backlight: brightness -> %" PRIu32 "\n", libbacklight_brightness(bctl));
+			pr_dbg("backlight: brightness -> %" PRIu32 ": lux: %" PRIu32 "\n", libbacklight_brightness(bctl), lux);
 			r = write_u32(d->backlight_brightness, libbacklight_brightness(bctl));
 			if (r)
 				goto exit;
@@ -505,6 +559,23 @@ int main(int argc, char** argv)
 			conf.max_lux = atoi(argv[i]);
 		}
 		else
+		if (!strcmp("--prox", argv[i]) || !strcmp("-p", argv[i])) {
+			if (++i >= argc) {
+				fprintf(stderr, "invalid -s/--sensor\n");
+				return 1;
+			}
+			devices.prox = argv[i];
+			conf.enable_trigger = 1;
+		}
+		else
+		if (!strcmp("--near", argv[i]) || !strcmp("-n", argv[i])) {
+			if (++i >= argc) {
+				fprintf(stderr, "invalid -s/--sensor\n");
+				return 1;
+			}
+			devices.prox_nearlevel = atoi(argv[i]);
+		}
+		else
 		if (!strcmp("--time", argv[i]) || !strcmp("-t", argv[i])) {
 			if (++i >= argc) {
 				fprintf(stderr, "invalid -t/--time\n");
@@ -537,7 +608,7 @@ int main(int argc, char** argv)
 		pr_err("mandatory argument PATH missing\n");
 		return 1;
 	}
-	if (!devices.interrupt_path && !devices.sensor) {
+	if (!devices.interrupt_path && !devices.sensor && !devices.prox) {
 		pr_err("Control source missing (interrupt/sensor/proxmitity) -- see help\n");
 		return 1;
 	}
