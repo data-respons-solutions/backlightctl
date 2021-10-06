@@ -294,31 +294,26 @@ static int init_conf(struct libbacklight_conf* conf, const struct devices* d)
 	return 0;
 }
 
-
-// return 0 for interrupt, 1 for timeout, 2 for signal, negative errno for error
-// fds[0] = signal
-// fds[1] = interrupt
-static int wait_int(struct pollfd* fds, nfds_t nfds, int timeout_ms)
+// Return 0 for OK and signal state in *interrupt
+// Negative errno for error
+static int wait_fd(struct pollfd* fds, int timeout_ms, int* interrupt)
 {
-	int r = 0;
-	switch(poll(fds, nfds, timeout_ms)) {
-	case -1:
+	int r = poll(fds, 1, timeout_ms);
+	if (r < 0) {
 		r = -errno;
 		pr_err("poll [%d]: %s\n", -r, strerror(-r));
-		return r;
-	case 0:
-		return 1;
-	default:
-		if ((fds[0].revents != 0)) {
-			fds[0].revents = 0;
-			return 2;
-		}
-		if (nfds > 1 && fds[1].revents != 0) {
-			fds[1].revents = 0;
-			return 0;
-		}
-		return -EINTR;
 	}
+	else
+	if (r > 0 && fds->revents > 0) {
+		*interrupt = 1;
+		fds->revents = 0;
+		r = 0;
+	}
+	else {
+		*interrupt = 0;
+	}
+
+	return r;
 }
 
 static int timestamp(struct timespec* ts)
@@ -388,41 +383,37 @@ static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 	struct timespec ts = {0,0};
 	int r = 0;
 	uint32_t lux = 0;
-	struct pollfd fds[2];
-	fds[0].fd = get_signalfd();
-	if (fds[0].fd < 0) {
+	struct pollfd signalfd;
+	signalfd.fd = get_signalfd();
+	if (signalfd.fd < 0) {
 		pr_err("Failed installing signal handler\n");
 		return -EFAULT;
 	}
-	fds[0].events = POLLIN;
-	fds[0].revents = 0;
+	signalfd.events = POLLIN;
+	signalfd.revents = 0;
 
+	struct pollfd interruptfd;
+	interruptfd.fd = -1;
 	if (d->interrupt_value) {
-		fds[1].fd = get_interrupt(d->interrupt_value);
-		if (fds[1].fd < 0) {
+		interruptfd.fd = get_interrupt(d->interrupt_value);
+		if (interruptfd.fd < 0) {
 			r = -errno;
 			pr_err("%s [%d]: %s\n", d->interrupt_value, -r, strerror(-r));
 			return r;
 		}
-		fds[1].events = POLLPRI;
-		fds[1].revents = 0;
+		interruptfd.events = POLLPRI;
+		interruptfd.revents = 0;
 	}
 
 	while (1) {
 		int trigger = 0;
-		r = wait_int(fds, d->interrupt_value ? 2 : 1, 0);
-		switch(r) {
-		case 0: // interrupt
-			trigger = 1;
-			break;
-		case 1: // timeout
-			break;
-		case 2: // signal
-			r = 0;
-			printf("Received signal -- exit\n");
-			goto exit;
-		default: // error
-			goto exit;
+
+		if (interruptfd.fd >= 0) {
+			r = wait_fd(&interruptfd, 0, &trigger);
+			if (r)
+				goto exit;
+			if (trigger != 0)
+				pr_dbg("interrupt: %d\n", trigger);
 		}
 
 		if (d->sensor_ch) {
@@ -443,27 +434,19 @@ static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 				goto exit;
 		}
 
-		// Delay loop or exit on signal
-		r = wait_int(fds, 1, delay_ms);
-		switch (r) {
-		case 0:
-		case 1:
+		r = wait_fd(&signalfd, delay_ms, &trigger);
+		if (r)
+			goto exit;
+		if (trigger != 0)
 			break;
-		case 2:
-			r = 0;
-			printf("Received signal -- exit\n");
-			goto exit;
-		default:
-			goto exit;
-		}
 	}
 
 	r = 0;
 
 exit:
 	write_u32(d->backlight_brightness, libbacklight_get_conf(bctl)->initial_brightness_step);
-	if (fds[1].fd >= 0)
-		close(fds[1].fd);
+	if (interruptfd.fd >= 0)
+		close(interruptfd.fd);
 	return r;
 }
 
