@@ -25,7 +25,7 @@ $(BUILD)/libbacklight.a: $(addprefix $(BUILD)/, ringbuf.o libbacklight.o)
 	$(AR) rcs $@ $^
 
 $(BUILD)/backlightctl: $(addprefix $(BUILD)/, backlightctl.o log.o) $(BUILD)/libbacklight.a
-	$(CC) -o $@ $^ $(LDFLAGS)
+	$(CC) -o $@ $^ $(LDFLAGS) -liio
 	
 $(BUILD)/test-libbacklight: $(addprefix $(BUILD)/, test-libbacklight.o) $(BUILD)/libbacklight.a
 	$(CXX) -o $@ $^ $(LDFLAGS) -lCatch2Main -lCatch2

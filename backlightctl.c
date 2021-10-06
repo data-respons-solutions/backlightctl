@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <sys/signalfd.h>
 #include <time.h>
+#include <iio.h>
 #include "log.h"
 #include "libbacklight.h"
 
@@ -16,6 +17,8 @@
 #define str(a) #a
 
 #define DEFAULT_ON_TIME_SEC 30
+#define DEFAULT_MIN_LUX 10
+#define DEFAULT_MAX_LUX 600
 
 static void print_usage(void)
 {
@@ -44,6 +47,13 @@ static void print_usage(void)
 	printf("    See kernel documentation Documentation/gpio/sysfs.txt\n");
 	printf("  -t, --time     Time in seconds to wait for interrupt before disabling backlight\n");
 	printf("    Default: %d\n", DEFAULT_ON_TIME_SEC);
+	printf("  -s, --sensor   Sensor input\n");
+	printf("    iio device and channel in format dev:chan\n");
+	printf("    For example: vcnl4000:illuminance\n");
+	printf("  --lmin         Lux value where backlight it set to 1\n");
+	printf("    Default: %d\n", DEFAULT_MIN_LUX);
+	printf("  --lmax         Lux value where backlight it set to max\n");
+	printf("    Default: %d\n", DEFAULT_MAX_LUX);
 	printf("\n");
 
 	printf("Return values:\n");
@@ -59,6 +69,8 @@ struct devices {
 	char *backlight_max_brightness;
 	char *interrupt_path;
 	char *interrupt_value;
+	char *sensor;
+	struct iio_channel *sensor_ch;
 };
 
 static void free_devices(struct devices* d)
@@ -79,6 +91,13 @@ static void free_devices(struct devices* d)
 		free(d->interrupt_value);
 		d->interrupt_value = NULL;
 	}
+	struct iio_context* ctx = NULL;
+	if (!ctx && d->sensor_ch) {
+		ctx = (struct iio_context*) iio_device_get_context(iio_channel_get_device(d->sensor_ch));
+		d->sensor_ch = NULL;
+	}
+	if (ctx)
+		iio_context_destroy(ctx);
 }
 
 static char* join_path(const char* base, const char* add)
@@ -97,12 +116,51 @@ static char* join_path(const char* base, const char* add)
 	return NULL;
 }
 
+struct iio_channel* init_iio_ch(const struct iio_context* ctx, const char* device)
+{
+	struct iio_channel *ch = NULL;
+	char *token = NULL;
+	char *tmp = malloc(strlen(device) + 1);
+	if (!tmp) {
+		pr_err("Failed allocating memory for iio sensor name and channel\n");
+		goto exit;
+	}
+	char *rest = tmp;
+	memcpy(tmp, device, strlen(device) + 1);
+
+	if ((token = strtok_r(rest, ":", &rest)) == NULL) {
+		pr_err("Failed extracting sensor device from name\n");
+		goto exit;
+	}
+	const struct iio_device *dev = iio_context_find_device(ctx, token);
+	if (!dev) {
+		pr_err("Failed finding iio device: %s\n", token);
+		goto exit;
+	}
+
+	if ((token = strtok_r(rest, ":", &rest)) == NULL) {
+		pr_err("Failed extracting sensor channel from name\n");
+		goto exit;
+	}
+	ch = iio_device_find_channel(dev, token, 0);
+	if (!ch)
+		pr_err("Failed finding iio channel %s\n", token);
+
+exit:
+	if (tmp)
+		free(tmp);
+
+	return ch;
+}
 
 /*
  *  Fills backlight_* and interrupt_* if respective path available.
  */
 static int init_devices(struct devices* d)
 {
+	struct iio_context *ctx = NULL;
+	int r = -ENOMEM;
+
 	if (d->backlight_path) {
 		pr_dbg("backlight: path: %s\n", d->backlight_path);
 
@@ -121,11 +179,29 @@ static int init_devices(struct devices* d)
 			goto error_exit;
 	}
 
-	return 0;
+	if (d->sensor) {
+		pr_dbg("sensor [device:channel]: %s\n", d->sensor);
+		ctx = iio_create_local_context();
+		if (!ctx) {
+			r = -errno;
+			pr_err("Failed creating iio context: %s\n", strerror(-r));
+			goto error_exit;
+		}
+		if ((d->sensor_ch = init_iio_ch(ctx, d->sensor)) == NULL) {
+			r = -ENODEV;
+			goto error_exit;
+		}
+	}
 
+	return 0;
 error_exit:
+	if (r == -ENOMEM)
+		pr_err("Memory allocation failed for file paths\n");
+	if (ctx)
+		iio_context_destroy(ctx);
+	d->sensor_ch = NULL;
 	free_devices(d);
-	return -ENOMEM;
+	return r;
 }
 
 static int read_u32(const char* path, uint32_t* value)
@@ -212,6 +288,9 @@ static int init_conf(struct libbacklight_conf* conf, const struct devices* d)
 	pr_dbg("backlight: max: %" PRIu32 ": initial: %" PRIu32 "\n",
 			conf->max_brightness_step, conf->initial_brightness_step);
 
+	if (conf->enable_sensor)
+		pr_dbg("sensor: max: %" PRIu32 ": min: %" PRIu32"\n", conf->max_lux, conf->min_lux);
+
 	return 0;
 }
 
@@ -283,11 +362,32 @@ static int get_signalfd(void)
 	return r;
 }
 
+static int read_sensor(const struct iio_channel* ch, uint32_t* lux)
+{
+	long long val = 0LL;
+	int r = iio_channel_attr_read_longlong(ch, "raw", &val);
+	if (r) {
+		pr_err("Failed reading sensor: %s\n", strerror(-r));
+		return r;
+	}
+
+	const struct iio_data_format *fmt = iio_channel_get_data_format(ch);
+	val = fmt->with_scale ? (long long) (val * fmt->scale + 0.5) : val;
+	if (val > UINT32_MAX || val < 0) {
+		pr_err("Sensor reading invalid: value: %lld\n", val);
+		return -EIO;
+	}
+
+	*lux = val;
+	return 0;
+}
+
 static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 {
 	const int delay_ms = 100;
 	struct timespec ts = {0,0};
 	int r = 0;
+	uint32_t lux = 0;
 	struct pollfd fds[2];
 	fds[0].fd = get_signalfd();
 	if (fds[0].fd < 0) {
@@ -310,7 +410,7 @@ static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 
 	while (1) {
 		int trigger = 0;
-		r = wait_int(fds, d->interrupt_value ? 2 : 1, delay_ms);
+		r = wait_int(fds, d->interrupt_value ? 2 : 1, 0);
 		switch(r) {
 		case 0: // interrupt
 			trigger = 1;
@@ -325,15 +425,36 @@ static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 			goto exit;
 		}
 
+		if (d->sensor_ch) {
+			r = read_sensor(d->sensor_ch, &lux);
+			if (r)
+				goto exit;
+			pr_dbg("sensor: %" PRIu32 " lux\n", lux);
+		}
+
 		r = timestamp(&ts);
 		if (r)
 			goto exit;
 
-		if (libbacklight_operate(bctl, &ts, trigger, 0) == LIBBACKLIGHT_BRIGHTNESS) {
+		if (libbacklight_operate(bctl, &ts, trigger, lux) == LIBBACKLIGHT_BRIGHTNESS) {
 			pr_dbg("backlight: brightness -> %" PRIu32 "\n", libbacklight_brightness(bctl));
 			r = write_u32(d->backlight_brightness, libbacklight_brightness(bctl));
 			if (r)
 				goto exit;
+		}
+
+		// Delay loop or exit on signal
+		r = wait_int(fds, 1, delay_ms);
+		switch (r) {
+		case 0:
+		case 1:
+			break;
+		case 2:
+			r = 0;
+			printf("Received signal -- exit\n");
+			goto exit;
+		default:
+			goto exit;
 		}
 	}
 
@@ -354,6 +475,8 @@ int main(int argc, char** argv)
 	struct libbacklight_conf conf;
 	memset(&conf, 0, sizeof(conf));
 	conf.trigger_timeout.tv_sec = DEFAULT_ON_TIME_SEC;
+	conf.min_lux = DEFAULT_MIN_LUX;
+	conf.max_lux = DEFAULT_MAX_LUX;
 
 	if (argc < 2) {
 		print_usage();
@@ -372,6 +495,31 @@ int main(int argc, char** argv)
 			}
 			devices.interrupt_path = argv[i];
 			conf.enable_trigger = 1;
+		}
+		else
+		if (!strcmp("--sensor", argv[i]) || !strcmp("-s", argv[i])) {
+			if (++i >= argc) {
+				fprintf(stderr, "invalid -s/--sensor\n");
+				return 1;
+			}
+			devices.sensor = argv[i];
+			conf.enable_sensor = 1;
+		}
+		else
+		if (!strcmp("--lmin", argv[i])) {
+			if (++i >= argc) {
+				fprintf(stderr, "invalid --lmin\n");
+				return 1;
+			}
+			conf.min_lux = atoi(argv[i]);
+		}
+		else
+		if (!strcmp("--lmax", argv[i])) {
+			if (++i >= argc) {
+				fprintf(stderr, "invalid --lmax\n");
+				return 1;
+			}
+			conf.max_lux = atoi(argv[i]);
 		}
 		else
 		if (!strcmp("--time", argv[i]) || !strcmp("-t", argv[i])) {
@@ -406,17 +554,15 @@ int main(int argc, char** argv)
 		pr_err("mandatory argument PATH missing\n");
 		return 1;
 	}
-	if (!devices.interrupt_path) {
-		pr_err("mandatory argument -i/--int missing\n");
+	if (!devices.interrupt_path && !devices.sensor) {
+		pr_err("Control source missing (interrupt/sensor/proxmitity) -- see help\n");
 		return 1;
 	}
 
 	struct timespec start = {0,0};
 	int r = init_devices(&devices);
-	if (r) {
-		pr_err("Memory allocation failed for file paths\n");
+	if (r)
 		goto exit;
-	}
 
 	r = init_conf(&conf, &devices);
 	if (r)
