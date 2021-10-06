@@ -134,6 +134,29 @@ TEST_CASE("Test sensor") {
 	destroy_libbacklight(&bctl);
 }
 
+TEST_CASE("Test sensor small lux gap") {
+	struct libbacklight_conf conf;
+	memset(&conf, 0, sizeof(conf));
+	conf.max_brightness_step = 23;
+	conf.initial_brightness_step = 23;
+	conf.enable_sensor = 1;
+	conf.min_lux = 10;
+	conf.max_lux = 200;
+	const struct timespec start = {0,0};
+	struct libbacklight_ctrl *bctl = create_libbacklight(&start, &conf);
+	REQUIRE(bctl);
+
+	SECTION("No backlight max overflow") {
+		struct timespec ts {0, 0};
+		for (int i = 0; i < 100; ++i) {
+			libbacklight_operate(bctl, &ts, 0, 220);
+			REQUIRE(libbacklight_brightness(bctl) <= conf.max_brightness_step);
+		}
+	}
+
+	destroy_libbacklight(&bctl);
+}
+
 TEST_CASE("Sensor and Trigger")
 {
 	struct libbacklight_conf conf;

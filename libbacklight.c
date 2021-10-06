@@ -21,18 +21,24 @@ static uint32_t lux_per_step(uint32_t min_lux, uint32_t max_lux, uint32_t max_st
 	return (max_lux - min_lux) / (max_steps - 1);
 }
 
-static uint32_t step_to_lux(uint32_t min_lux, uint32_t lux_per_step, uint32_t step)
+static uint32_t step_to_lux(uint32_t min_lux, uint32_t max_lux, uint32_t lux_per_step, uint32_t step)
 {
-	return min_lux + (lux_per_step * (step - 1));
+	const uint32_t lux = min_lux + (lux_per_step * (step - 1));
+	if (lux < min_lux)
+		return min_lux;
+	if (lux > max_lux)
+		return max_lux;
+	return lux;
 }
 
-static uint32_t lux_to_step(uint32_t min_lux, uint32_t max_lux, uint32_t lux_per_step, uint32_t lux)
+static uint32_t lux_to_step(uint32_t min_lux, uint32_t max_step, uint32_t lux_per_step, uint32_t lux)
 {
-	if (lux > max_lux)
-		return lux_to_step(min_lux, max_lux, lux_per_step, max_lux);
-	if (lux < min_lux)
+	const uint32_t step = (lux > min_lux ? (lux - min_lux) : (min_lux - lux)) / lux_per_step + 1;
+	if (step > max_step)
+		return max_step;
+	if (step < 1)
 		return 1;
-	return (lux - min_lux) / lux_per_step + 1;
+	return step;
 }
 
 struct libbacklight_ctrl* create_libbacklight(const struct timespec* ts, const struct libbacklight_conf* conf)
@@ -59,7 +65,7 @@ struct libbacklight_ctrl* create_libbacklight(const struct timespec* ts, const s
 		if (!bctl->sensor_ring)
 			goto error_exit;
 		bctl->lux_per_step = lux_per_step(conf->min_lux, conf->max_lux, conf->max_brightness_step);
-		const uint32_t initial_lux = step_to_lux(conf->min_lux, bctl->lux_per_step, conf->initial_brightness_step);
+		const uint32_t initial_lux = step_to_lux(conf->min_lux, conf->max_lux, bctl->lux_per_step, conf->initial_brightness_step);
 		for (size_t i = 0; i < ringbuf_capacity(bctl->sensor_ring); ++i) {
 			ringbuf_push(bctl->sensor_ring, initial_lux);
 			bctl->sensor_sum += initial_lux;
@@ -140,7 +146,7 @@ enum libbacklight_action libbacklight_operate(struct libbacklight_ctrl* bctl, co
 		 */
 		if (bctl->brightness_step > 0) {
 			const uint32_t avg = bctl->sensor_sum / ringbuf_size(bctl->sensor_ring);
-			const uint32_t new_step = lux_to_step(bctl->conf.min_lux, bctl->conf.max_lux, bctl->lux_per_step, avg);
+			const uint32_t new_step = lux_to_step(bctl->conf.min_lux, bctl->conf.max_brightness_step, bctl->lux_per_step, avg);
 			if (new_step != bctl->brightness_step) {
 				bctl->brightness_step = new_step;
 				ac = LIBBACKLIGHT_BRIGHTNESS;
