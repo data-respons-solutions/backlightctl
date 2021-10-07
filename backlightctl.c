@@ -196,7 +196,11 @@ static int init_devices(struct devices* d)
 	}
 
 	if (d->sensor || d->prox) {
-		pr_dbg("sensor [device:channel]: %s\n", d->sensor);
+		if (d->sensor)
+			pr_dbg("sensor [device:channel]: %s\n", d->sensor);
+		if (d->prox)
+			pr_dbg("prox [device:channel]: %s\n", d->prox);
+
 		ctx = iio_create_local_context();
 		if (!ctx) {
 			r = -errno;
@@ -357,36 +361,45 @@ static int timestamp(struct timespec* ts)
 	return 0;
 }
 
-static int get_interrupt(const char* path)
+static struct pollfd get_interruptfd(const char* path)
 {
-	int fd = open(path, O_RDONLY);
-	if (fd < 0) {
-		fd = -errno;
-	}
-	else {
+	struct pollfd pfd;
+
+	pfd.events = POLLPRI;
+	pfd.revents = 0;
+	pfd.fd = -1;
+
+	pfd.fd = open(path, O_RDONLY);
+	if (pfd.fd > -1) {
 		// clear value before polling
 		char value;
-		if (read(fd, &value, 1) < 0) {
-			close(fd);
-			fd = -errno;
+		if (read(pfd.fd, &value, 1) < 0) {
+			const int e = errno;
+			close(pfd.fd);
+			pfd.fd = -e;
 	    }
 	}
-	return fd;
+
+	return pfd;
 }
 
-static int get_signalfd(void)
+static struct pollfd get_signalfd(void)
 {
+	struct pollfd pfd;
 	sigset_t mask;
+
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	pfd.fd = -1;
 
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTERM);
 
-	int r = -1;
-
 	if (sigprocmask(SIG_BLOCK, &mask, NULL) != -1)
-		r = signalfd(-1, &mask, 0);
-	return r;
+		pfd.fd = signalfd(-1, &mask, 0);
+
+	return pfd;
 }
 
 static int read_sensor(const struct iio_channel* ch, uint32_t* lux)
@@ -426,41 +439,34 @@ static int read_prox(const struct iio_channel* ch, long long nearlevel, long lon
 static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 {
 	const int delay_ms = 100;
-	struct timespec ts = {0,0};
-	int r = 0;
-	uint32_t lux = 0;
-	struct pollfd signalfd;
-	signalfd.fd = get_signalfd();
+	struct pollfd signalfd = get_signalfd();
 	if (signalfd.fd < 0) {
 		pr_err("Failed installing signal handler\n");
 		return -EFAULT;
 	}
-	signalfd.events = POLLIN;
-	signalfd.revents = 0;
 
 	struct pollfd interruptfd;
-	interruptfd.fd = -1;
 	if (d->interrupt_value) {
-		interruptfd.fd = get_interrupt(d->interrupt_value);
+		interruptfd = get_interruptfd(d->interrupt_value);
 		if (interruptfd.fd < 0) {
-			r = -errno;
-			pr_err("%s [%d]: %s\n", d->interrupt_value, -r, strerror(-r));
-			return r;
+			pr_err("Failed initializing interrupt input: %s\n", strerror(-interruptfd.fd));
+			return interruptfd.fd;
 		}
-		interruptfd.events = POLLPRI;
-		interruptfd.revents = 0;
 	}
+
+	struct timespec ts = {0,0};
 	long long prox_previous = 0LL;
+	int r = 0;
+	int trigger = 0;
+	uint32_t lux = 0;
 
 	while (1) {
-		int trigger = 0;
-
 		if (!trigger && interruptfd.fd >= 0) {
 			r = wait_fd(&interruptfd, 0, &trigger);
 			if (r)
 				goto exit;
 			if (trigger != 0)
-				pr_dbg("interrupt: %d\n", trigger);
+				pr_dbg("trigger: int: %d\n", trigger);
 		}
 
 		if (!trigger && d->prox_ch) {
@@ -468,7 +474,7 @@ static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 			if (r)
 				goto exit;
 			if (trigger != 0)
-				pr_dbg("prox: %d: raw %lld\n", trigger, prox_previous);
+				pr_dbg("trigger: prox: %d: raw %lld\n", trigger, prox_previous);
 		}
 
 		if (d->sensor_ch) {
