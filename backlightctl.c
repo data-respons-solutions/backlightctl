@@ -60,7 +60,7 @@ static void print_usage(void)
 	printf("    iio device and channel in format dev:chan\n");
 	printf("    For example: vcnl4000:proximity\n");
 	printf("    Turn off backlight after --time inactivity\n");
-	printf("    If input below iio attribute nearlevel then backlight is kept enabled\n");
+	printf("    If input above iio attribute nearlevel then backlight is kept enabled\n");
 	printf("  -n, --near     Proximity near level override\n");
 	printf("    Default to 0 if no \"nearlevel\" iio attribute for proximity input channel\n");
 	printf("\n");
@@ -431,7 +431,7 @@ static int read_prox(const struct iio_channel* ch, long long nearlevel, long lon
 		return r;
 	}
 
-	*trigger = (val <= nearlevel || val != *prev) ? 1 : 0;
+	*trigger = val >= nearlevel ? 1 : 0;
 	*prev = val;
 	return 0;
 }
