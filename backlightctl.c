@@ -446,6 +446,7 @@ static int control_loop(struct libbacklight_ctrl* bctl, const struct devices* d)
 	}
 
 	struct pollfd interruptfd;
+	interruptfd.fd = -1;
 	if (d->interrupt_value) {
 		interruptfd = get_interruptfd(d->interrupt_value);
 		if (interruptfd.fd < 0) {
