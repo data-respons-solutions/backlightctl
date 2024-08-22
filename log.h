@@ -7,6 +7,9 @@
 #define pr_err(fmt, ...) \
 		fprintf(stderr, "error: " fmt, ##__VA_ARGS__);
 
+#define pr_info(fmt, ...) \
+		printf(fmt, ##__VA_ARGS__);
+
 void enable_debug(void);
 void print_debug(const char* fmt, ...);
 
